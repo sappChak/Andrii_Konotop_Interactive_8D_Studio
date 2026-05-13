@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Acoustic Architect // Survival Protocol</title>
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --bg-deep: #000000;
+            --fg-main: #00FF00;
+            --fg-dim: #333333;
+            --font-ui: 'JetBrains Mono', monospace;
+        }
+
+        body {
+            margin: 0; overflow: hidden;
+            background-color: var(--bg-deep); color: var(--fg-main);
+            font-family: var(--font-ui); font-size: 14px;
+            transition: background-color 0.1s;
+        }
+
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%;
+            pointer-events: none; display: flex; flex-direction: column;
+            align-items: center; z-index: 10;
+        }
+
+        header {
+            text-align: center; padding: 25px 0 10px 0; width: 100%;
+            pointer-events: auto;
+        }
+
+        h1 { 
+            margin: 0; font-weight: 700; font-size: 24px;
+            color: var(--fg-main); letter-spacing: 2px;
+            text-transform: uppercase;
+        }
+
+        .controls {
+            margin-top: 10px; padding: 10px 20px; background: var(--bg-deep);
+            border: 1px solid var(--fg-main); display: flex; gap: 15px; 
+            pointer-events: auto; align-items: center;
+        }
+
+        input[type="file"] { font-family: var(--font-ui); color: var(--fg-main); }
+
+        button, input[type="file"]::file-selector-button {
+            background: var(--bg-deep); color: var(--fg-main); 
+            border: 1px solid var(--fg-main); padding: 6px 16px; cursor: pointer;
+            font-family: var(--font-ui); font-size: 14px; text-transform: uppercase;
+            transition: all 0.1s;
+        }
+
+        button:hover:not(:disabled), 
+        input[type="file"]::file-selector-button:hover {
+            background: var(--fg-main); color: var(--bg-deep);
+        }
+
+        button:disabled { 
+            border-color: var(--fg-dim); color: var(--fg-dim); cursor: not-allowed; 
+            opacity: 0.5;
+        }
+
+        .lil-gui { 
+            --background-color: var(--bg-deep);
+            --text-color: var(--fg-main);
+            --title-background-color: var(--bg-deep);
+            --widget-color: var(--bg-deep);
+            --hover-color: var(--fg-main);
+            --focus-color: var(--fg-main);
+            --number-color: var(--fg-main);
+            --string-color: var(--fg-main);
+            font-family: var(--font-ui); 
+        }
+
+        .lil-gui.root {
+            border: 1px solid var(--fg-main);
+            right: 20px; top: 20px;
+            position: fixed; z-index: 100;
+        }
+
+        .lil-gui .title { border-bottom: 1px solid var(--fg-dim); }
+
+        #game-overlay {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0,20,0,0.85); border: 2px solid var(--fg-main);
+            padding: 30px 40px; font-size: 16px; pointer-events: auto;
+            display: none; z-index: 20; text-transform: uppercase; 
+            line-height: 1.8; text-align: center; cursor: pointer;
+            box-shadow: 0 0 20px rgba(0,255,0,0.2);
+        }
+
+        #game-overlay:hover { background: rgba(0,40,0,0.95); }
+
+        #webgl-container {
+            position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 1;
+        }
+    </style>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <header><h1 id="dynamicTitle">ACOUSTIC_ARCHITECT.SYS</h1></header>
+        <div id="mainControls" class="controls">
+            <input type="file" id="audioUpload" accept="audio/*">
+            <button id="playBtn" disabled>Play</button>
+            <button id="pauseBtn" disabled>Pause</button>
+        </div>
+    </div>
+
+    <div id="game-overlay">
+        <strong>CLICK TO INITIATE SURVIVAL</strong><br><br>
+        [W][A][S][D] Move | Mouse Look<br>
+        Avoid the anomaly.
+    </div>
+
+    <audio id="audioElement"></audio>
+    <div id="webgl-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { TransformControls } from 'three/addons/controls/TransformControls.js';
+        import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+        import GUI from 'lil-gui';
+
+        const fileInput = document.getElementById('audioUpload');
+        const playBtn = document.getElementById('playBtn');
+        const pauseBtn = document.getElementById('pauseBtn');
+        const audioElement = document.getElementById('audioElement');
+        const gameOverlay = document.getElementById('game-overlay');
+
+        let audioCtx, track, panner, analyser, convolver, materialFilter;
+        let wetGain, dryGain;
+        let isPlaying = false;
+        
+        const fftSize = 256;
+        const bufferLength = fftSize / 2; 
+        let dataArray = new Uint8Array(bufferLength);
+        
+        let scene, camera, renderer, clock, orbitControls, transformControls, fpsControls;
+        let audioTexture, audioSphere, listenerMesh, tubeMesh, orbitCurve;
+        let floorUniforms, tubeMat;
+        let terrainGroup = new THREE.Group();
+        let terrainMaterials = [];
+        let obstacleBoxes = []; 
+
+        const targetScale = new THREE.Vector3(1, 1, 1);
+        const keys = { w: false, a: false, s: false, d: false };
+
+        const params = {
+            appMode: 'ARCHITECT',
+            themeColor: '#00FF00',
+            pulseIntensity: 2.5,
+            autoOrbit: false,
+            orbitSpeed: 1.0,
+            complexity: 5,
+            generateSpline: () => createGenerativeSpline(),
+            roomScale: 'Studio',
+            wallMaterial: 'Wood',
+            cameraMode: 'Free Fly'
+        };
+
+        const rooms = {
+            'Closet': { duration: 0.2, decay: 8.0 },
+            'Studio': { duration: 0.8, decay: 4.0 },
+            'Cathedral': { duration: 4.0, decay: 1.0 },
+            'Stadium': { duration: 6.0, decay: 0.5 }
+        };
+
+        const materials = {
+            'Concrete': { type: 'highpass', freq: 100 },
+            'Wood': { type: 'lowpass', freq: 4000 },
+            'Carpet': { type: 'lowpass', freq: 800 },
+            'Glass': { type: 'highpass', freq: 2000 }
+        };
+
+        try {
+            init3DScene();
+            setupGUI();
+            setupInputListeners();
+        } catch (e) {
+            console.error("FATAL ENGINE ERROR:", e);
+            document.getElementById('dynamicTitle').innerText = "SYSTEM FAILURE";
+        }
+
+        function updateTheme(hex) {
+            const color = new THREE.Color(hex);
+            document.documentElement.style.setProperty('--fg-main', hex);
+            
+            if(floorUniforms) floorUniforms.uPeakColor.value = color;
+            if(audioSphere) audioSphere.material.color = color;
+            if(listenerMesh) listenerMesh.material.color = color;
+            if(tubeMat) tubeMat.color = color;
+            terrainMaterials.forEach(mat => mat.color = color);
+        }
+
+        async function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                track = audioCtx.createMediaElementSource(audioElement);
+                panner = audioCtx.createPanner();
+                
+                panner.panningModel = 'HRTF';
+                panner.distanceModel = 'inverse';
+                panner.refDistance = 10;
+                panner.rolloffFactor = 1.0;
+                panner.maxDistance = 10000;
+                
+                dryGain = audioCtx.createGain();
+                wetGain = audioCtx.createGain();
+                materialFilter = audioCtx.createBiquadFilter();
+                convolver = audioCtx.createConvolver();
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = fftSize;
+                
+                track.connect(panner);
+                panner.connect(dryGain);
+                dryGain.connect(analyser);
+                panner.connect(materialFilter);
+                materialFilter.connect(convolver);
+                convolver.connect(wetGain);
+                wetGain.connect(analyser);
+                analyser.connect(audioCtx.destination);
+                
+                updateAcoustics();
+                syncAudioPosition();
+            }
+            
+            if (audioCtx.state === 'suspended') {
+                await audioCtx.resume();
+            }
+        }
+
+        function updateAcoustics() {
+            if (!audioCtx) return;
+            const mat = materials[params.wallMaterial];
+            materialFilter.type = mat.type;
+            materialFilter.frequency.value = mat.freq;
+            const room = rooms[params.roomScale];
+            convolver.buffer = generateImpulseResponse(room.duration, room.decay);
+            wetGain.gain.value = room.duration > 1.0 ? 0.8 : 0.4;
+            dryGain.gain.value = room.duration > 1.0 ? 0.6 : 0.9;
+        }
+
+        function generateImpulseResponse(duration, decay) {
+            const sampleRate = audioCtx.sampleRate;
+            const length = Math.floor(sampleRate * duration);
+            const impulse = audioCtx.createBuffer(2, length, sampleRate);
+            for (let i = 0; i < 2; i++) {
+                const channel = impulse.getChannelData(i);
+                for (let j = 0; j < length; j++) {
+                    channel[j] = (Math.random()*2 - 1) * Math.pow(1 - j/length, decay);
+                }
+            }
+            return impulse;
+        }
+
+        function syncAudioPosition() {
+            if (!panner || !audioCtx) return;
+
+            panner.positionX.value = audioSphere.position.x;
+            panner.positionY.value = audioSphere.position.y;
+            panner.positionZ.value = audioSphere.position.z;
+
+            const listener = audioCtx.listener;
+            let headPos = new THREE.Vector3();
+            let headFwd = new THREE.Vector3();
+            let headUp = new THREE.Vector3(0, 1, 0);
+
+            if (params.appMode === 'SURVIVAL' || params.cameraMode === 'First Person') {
+                headPos.copy(camera.position);
+                camera.getWorldDirection(headFwd);
+                headUp.copy(camera.up);
+            } else {
+                headPos.copy(listenerMesh.position);
+                headFwd.set(0, 0, -1);
+            }
+
+            if (listener.positionX) {
+                listener.positionX.value = headPos.x;
+                listener.positionY.value = headPos.y;
+                listener.positionZ.value = headPos.z;
+                listener.forwardX.value = headFwd.x;
+                listener.forwardY.value = headFwd.y;
+                listener.forwardZ.value = headFwd.z;
+                listener.upX.value = headUp.x;
+                listener.upY.value = headUp.y;
+                listener.upZ.value = headUp.z;
+            } else {
+                listener.setPosition(headPos.x, headPos.y, headPos.z);
+                listener.setOrientation(
+                    headFwd.x, headFwd.y, headFwd.z, headUp.x, headUp.y, headUp.z
+                );
+            }
+        }
+
+        function init3DScene() {
+            const container = document.getElementById('webgl-container');
+            clock = new THREE.Clock();
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.025);
+            
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 1000);
+            camera.position.set(25, 18, 25);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+            
+            audioTexture = new THREE.DataTexture(dataArray, bufferLength, 1, THREE.RedFormat);
+            
+            floorUniforms = {
+                uTime: { value: 0.0 },
+                uAudioData: { value: audioTexture },
+                uGridColor: { value: new THREE.Color(0x222222) },
+                uBaseColor: { value: new THREE.Color(0x000000) },
+                uPeakColor: { value: new THREE.Color(params.themeColor) },
+                uIsSurvival: { value: 0.0 }
+            };
+            
+            const floorMat = new THREE.ShaderMaterial({
+                uniforms: floorUniforms,
+                vertexShader: `
+                    uniform float uTime; uniform sampler2D uAudioData;
+                    uniform float uIsSurvival;
+                    varying float vHeight; varying vec2 vUv;
+                    void main() {
+                        vUv = uv; vec3 pos = position;
+                        float dist = distance(uv, vec2(0.5));
+                        float audioSample = texture2D(uAudioData, vec2(dist*2.0, 0.5)).r;
+                        float wave = sin(pos.x*0.4 + uTime)*cos(pos.y*0.4 + uTime)*0.5;
+                        
+                        // Create a flat, calm island in the center for the cube
+                        float islandMask = smoothstep(0.015, 0.06, dist);
+                        
+                        float h = (wave * islandMask) + (audioSample * 6.0 * islandMask); 
+                        pos.z = mix(h, 0.0, uIsSurvival); 
+                        vHeight = h;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+                    }`,
+                fragmentShader: `
+                    uniform vec3 uBaseColor; uniform vec3 uGridColor; 
+                    uniform vec3 uPeakColor; uniform float uIsSurvival;
+                    varying float vHeight; varying vec2 vUv;
+                    void main() {
+                        float h = mix(clamp(vHeight / 4.0, 0.0, 1.0), 0.0, uIsSurvival);
+                        vec3 color = mix(uBaseColor, uGridColor, h);
+                        float peakFactor = mix(
+                            clamp((vHeight-3.0)/2.0, 0.0, 1.0), 0.0, uIsSurvival
+                        );
+                        color = mix(color, uPeakColor, peakFactor);
+                        
+                        if(fract(vUv * 50.0).x < 0.02 || fract(vUv * 50.0).y < 0.02) {
+                            color = mix(color, uPeakColor, 0.4);
+                        }
+                        gl_FragColor = vec4(color, 1.0);
+                    }`,
+                transparent: true
+            });
+            const floorMesh = new THREE.Mesh(new THREE.PlaneGeometry(120, 120, 128, 128), floorMat);
+            floorMesh.rotation.x = -Math.PI / 2; floorMesh.position.y = -1;
+            scene.add(floorMesh);
+            
+            listenerMesh = new THREE.Mesh(
+                new THREE.BoxGeometry(1.5, 1.5, 1.5), 
+                new THREE.MeshBasicMaterial({ color: params.themeColor, wireframe: true })
+            );
+            listenerMesh.position.set(0, 0.5, 0);
+            scene.add(listenerMesh);
+            
+            audioSphere = new THREE.Mesh(
+                new THREE.IcosahedronGeometry(1.2, 1), 
+                new THREE.MeshBasicMaterial({ color: params.themeColor, wireframe: true })
+            );
+            audioSphere.position.set(10, 2, 0);
+            scene.add(audioSphere);
+            
+            createGenerativeSpline();
+            generateTerrain();
+            
+            fpsControls = new PointerLockControls(camera, document.body);
+            orbitControls = new OrbitControls(camera, renderer.domElement);
+            orbitControls.enableDamping = true; orbitControls.maxDistance = 80;
+            
+            transformControls = new TransformControls(camera, renderer.domElement);
+            transformControls.attach(audioSphere);
+            scene.add(transformControls);
+            
+            transformControls.addEventListener('dragging-changed', (e) => {
+                if (params.cameraMode === 'Free Fly' && params.appMode === 'ARCHITECT') {
+                    orbitControls.enabled = !e.value;
+                }
+            });
+            
+            window.addEventListener('resize', onWindowResize);
+            renderer.setAnimationLoop(animate);
+        }
+
+        function createGenerativeSpline() {
+            if (tubeMesh) scene.remove(tubeMesh);
+            const points = [];
+            for (let i = 0; i < params.complexity; i++) {
+                const angle = (i / params.complexity) * Math.PI * 2;
+                const r = 15 + (Math.random() - 0.5) * 10;
+                points.push(new THREE.Vector3(
+                    Math.cos(angle)*r, 2 + Math.random()*12, Math.sin(angle)*r
+                ));
+            }
+            orbitCurve = new THREE.CatmullRomCurve3(points, true);
+            tubeMat = new THREE.MeshBasicMaterial({ 
+                color: params.themeColor, transparent: true, opacity: 0.3, wireframe: true 
+            });
+            const tubeGeo = new THREE.TubeGeometry(orbitCurve, 200, 0.05, 4, true);
+            tubeMesh = new THREE.Mesh(tubeGeo, tubeMat);
+            scene.add(tubeMesh);
+        }
+
+        function generateTerrain() {
+            scene.add(terrainGroup);
+            terrainGroup.visible = false; 
+            obstacleBoxes = []; 
+            
+            const geometries = [
+                new THREE.BoxGeometry(4, 10, 4),
+                new THREE.ConeGeometry(3, 12, 4),
+                new THREE.CylinderGeometry(2, 2, 8, 6)
+            ];
+
+            for (let i = 0; i < 40; i++) {
+                const geo = geometries[Math.floor(Math.random() * geometries.length)];
+                const mat = new THREE.MeshBasicMaterial({ 
+                    color: params.themeColor, wireframe: true 
+                });
+                terrainMaterials.push(mat);
+                
+                const obstacle = new THREE.Mesh(geo, mat);
+                obstacle.position.x = (Math.random() - 0.5) * 80;
+                obstacle.position.z = (Math.random() - 0.5) * 80;
+                
+                let height = 10;
+                if (geo.type === 'ConeGeometry') height = 12;
+                if (geo.type === 'CylinderGeometry') height = 8;
+                obstacle.position.y = height / 2 - 1;
+                
+                if(obstacle.position.distanceTo(new THREE.Vector3(0,0,0)) > 8) {
+                    terrainGroup.add(obstacle);
+                    obstacle.updateMatrixWorld(true);
+                    const box = new THREE.Box3().setFromObject(obstacle);
+                    obstacleBoxes.push(box);
+                }
+            }
+        }
+
+        function setupGUI() {
+            const gui = new GUI({ title: 'SYSTEM_CONFIG' });
+            
+            gui.add(params, 'appMode', ['ARCHITECT', 'SURVIVAL'])
+               .name('PROTOCOL').onChange(switchMode);
+
+            const f0 = gui.addFolder('STYLE');
+            f0.addColor(params, 'themeColor').name('THEME_RGB').onChange(updateTheme);
+            f0.add(params, 'pulseIntensity', 0.5, 5.0).name('PULSE_INTENSITY');
+
+            const archFolder = gui.addFolder('TRAJECTORY (ARCHITECT)');
+            archFolder.add(params, 'autoOrbit').name('AUTO_ORBIT').listen().onChange(v => {
+                v ? transformControls.detach() : transformControls.attach(audioSphere);
+            });
+            archFolder.add(params, 'orbitSpeed', 0.1, 5.0).name('ORBIT_SPEED');
+            archFolder.add(params, 'complexity', 3, 20).step(1).name('SPLINE_NODES');
+            archFolder.add(params, 'generateSpline').name('EXTRACT_SPLINE');
+            
+            const f2 = gui.addFolder('ACOUSTICS');
+            f2.add(params, 'roomScale', ['Closet', 'Studio', 'Cathedral', 'Stadium'])
+              .name('ROOM_SCALE').onChange(updateAcoustics);
+            f2.add(params, 'wallMaterial', ['Concrete', 'Wood', 'Carpet', 'Glass'])
+              .name('MATERIAL').onChange(updateAcoustics);
+            
+            const f3 = gui.addFolder('VIEW');
+            f3.add(params, 'cameraMode', ['Free Fly', 'First Person'])
+              .name('CAMERA').onChange(v => {
+                if(params.appMode === 'SURVIVAL') return; 
+                if (v === 'First Person') { 
+                    orbitControls.enabled = false; transformControls.detach(); 
+                } else { 
+                    orbitControls.enabled = true; camera.position.set(25, 18, 25); 
+                    if (!params.autoOrbit) transformControls.attach(audioSphere); 
+                }
+            });
+        }
+
+        function switchMode(mode) {
+            if (mode === 'SURVIVAL') {
+                document.getElementById('dynamicTitle').innerText = "SURVIVAL.EXE";
+                gameOverlay.style.display = 'block';
+                gameOverlay.innerHTML = "<strong>CLICK TO INITIATE SURVIVAL</strong><br><br>[W][A][S][D] Move | Mouse Look<br>Avoid the anomaly.";
+                
+                tubeMesh.visible = false;
+                terrainGroup.visible = true;
+                floorUniforms.uIsSurvival.value = 1.0;
+                
+                transformControls.detach();
+                orbitControls.enabled = false;
+                params.autoOrbit = false;
+                
+                camera.position.set(0, 1.5, 0);
+                audioSphere.position.set(30, 2, -30);
+            } else {
+                document.getElementById('dynamicTitle').innerText = "ACOUSTIC_ARCHITECT.SYS";
+                gameOverlay.style.display = 'none';
+                
+                tubeMesh.visible = true;
+                terrainGroup.visible = false;
+                floorUniforms.uIsSurvival.value = 0.0;
+                
+                fpsControls.unlock();
+                
+                listenerMesh.position.set(0, 0.5, 0);
+                audioSphere.position.set(10, 2, 0);
+                
+                if (params.cameraMode === 'Free Fly') {
+                    orbitControls.enabled = true;
+                    orbitControls.update(); 
+                    camera.position.set(25, 18, 25);
+                    transformControls.attach(audioSphere);
+                }
+            }
+            syncAudioPosition();
+        }
+
+        function setupInputListeners() {
+            window.addEventListener('keydown', (e) => {
+                if(params.appMode !== 'SURVIVAL') return;
+                if(e.key === 'w' || e.key === 'W') keys.w = true;
+                if(e.key === 'a' || e.key === 'A') keys.a = true;
+                if(e.key === 's' || e.key === 'S') keys.s = true;
+                if(e.key === 'd' || e.key === 'D') keys.d = true;
+            });
+            window.addEventListener('keyup', (e) => {
+                if(params.appMode !== 'SURVIVAL') return;
+                if(e.key === 'w' || e.key === 'W') keys.w = false;
+                if(e.key === 'a' || e.key === 'A') keys.a = false;
+                if(e.key === 's' || e.key === 'S') keys.s = false;
+                if(e.key === 'd' || e.key === 'D') keys.d = false;
+            });
+
+            gameOverlay.addEventListener('click', async () => {
+                if (params.appMode === 'SURVIVAL') {
+                    if (audioElement.src && !isPlaying) {
+                        await initAudio();
+                        audioElement.play().catch(e => console.error(e));
+                        isPlaying = true;
+                        playBtn.disabled = true; pauseBtn.disabled = false;
+                    }
+                    fpsControls.lock();
+                }
+            });
+
+            fpsControls.addEventListener('lock', () => {
+                gameOverlay.style.display = 'none';
+            });
+
+            fpsControls.addEventListener('unlock', () => {
+                if (params.appMode === 'SURVIVAL') {
+                    gameOverlay.style.display = 'block';
+                    gameOverlay.innerHTML = "<strong>SYSTEM PAUSED</strong><br><br>CLICK TO RESUME<br>[W][A][S][D] Move | Mouse Look";
+                    if (isPlaying) {
+                        audioElement.pause();
+                        isPlaying = false;
+                        playBtn.disabled = false; pauseBtn.disabled = true;
+                    }
+                }
+            });
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function checkCollision(px, pz) {
+            const playerRadius = 0.55; 
+            const pBox = new THREE.Box3(
+                new THREE.Vector3(px - playerRadius, 0, pz - playerRadius),
+                new THREE.Vector3(px + playerRadius, 2, pz + playerRadius)
+            );
+            return obstacleBoxes.some(box => pBox.intersectsBox(box));
+        }
+
+        function animate() {
+            floorUniforms.uTime.value = clock.getElapsedTime();
+            
+            if (params.appMode === 'SURVIVAL') {
+                if (fpsControls.isLocked) {
+                    const speed = 0.3;
+                    const oldX = camera.position.x;
+                    const oldZ = camera.position.z;
+                    
+                    if (keys.w) fpsControls.moveForward(speed);
+                    if (keys.s) fpsControls.moveForward(-speed);
+                    if (keys.a) fpsControls.moveRight(-speed);
+                    if (keys.d) fpsControls.moveRight(speed);
+
+                    let newX = camera.position.x;
+                    let newZ = camera.position.z;
+                    
+                    camera.position.set(oldX, 1.5, oldZ);
+
+                    newX = Math.max(-45, Math.min(45, newX));
+                    newZ = Math.max(-45, Math.min(45, newZ));
+
+                    if (!checkCollision(newX, oldZ)) {
+                        camera.position.x = newX;
+                    }
+                    if (!checkCollision(camera.position.x, newZ)) {
+                        camera.position.z = newZ;
+                    }
+
+                    listenerMesh.position.x = camera.position.x;
+                    listenerMesh.position.z = camera.position.z;
+                }
+
+                if (isPlaying) {
+                    const enemySpeed = 0.12;
+                    const direction = new THREE.Vector3().subVectors(
+                        listenerMesh.position, audioSphere.position
+                    );
+                    direction.y = 0; 
+                    
+                    const dist = direction.length();
+                    
+                    if (dist < 1.5) {
+                        document.body.style.backgroundColor = "#550000";
+                        setTimeout(() => { document.body.style.backgroundColor = "var(--bg-deep)"; }, 200);
+                        camera.position.set(0, 1.5, 0);
+                        listenerMesh.position.set(0, 0.5, 0);
+                        audioSphere.position.set(30, 2, -30);
+                    } 
+                    else if (dist > 0.5) { 
+                        direction.normalize();
+                        audioSphere.position.add(direction.multiplyScalar(enemySpeed));
+                    }
+                }
+            } else {
+                if (params.cameraMode === 'First Person') {
+                    camera.position.set(0, 1.5, 0); camera.lookAt(audioSphere.position);
+                } else {
+                    orbitControls.update();
+                }
+                
+                if (params.autoOrbit && isPlaying) {
+                    const duration = 15000 / params.orbitSpeed;
+                    const time = (Date.now() % duration) / duration;
+                    audioSphere.position.copy(orbitCurve.getPoint(time));
+                }
+            }
+            
+            if (isPlaying && analyser) {
+                analyser.getByteFrequencyData(dataArray);
+                audioTexture.needsUpdate = true; 
+                
+                let sum = 0;
+                for (let i = 0; i < 4; i++) { sum += dataArray[i]; }
+                let avg = sum / 4;
+                let normalized = avg / 255;
+                let pop = Math.pow(normalized, 1.5) * params.pulseIntensity;
+                
+                targetScale.set(1 + pop, 1 + pop, 1 + pop);
+                audioSphere.scale.lerp(targetScale, 0.25);
+            } else {
+                targetScale.set(1, 1, 1);
+                audioSphere.scale.lerp(targetScale, 0.1);
+            }
+            
+            syncAudioPosition();
+            renderer.render(scene, camera);
+        }
+
+        audioElement.onended = () => {
+            isPlaying = false; playBtn.disabled = false; pauseBtn.disabled = true;
+            params.autoOrbit = false;
+            if (params.appMode === 'ARCHITECT' && params.cameraMode !== 'First Person') {
+                transformControls.attach(audioSphere);
+            }
+        };
+
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                audioElement.src = URL.createObjectURL(file);
+                playBtn.disabled = false;
+            }
+        });
+
+        playBtn.addEventListener('click', async () => {
+            await initAudio(); 
+            audioElement.play().catch(e => console.error("Playback blocked:", e));
+            isPlaying = true; playBtn.disabled = true; pauseBtn.disabled = false;
+        });
+
+        pauseBtn.addEventListener('click', () => {
+            audioElement.pause();
+            isPlaying = false; playBtn.disabled = false; pauseBtn.disabled = true;
+        });
+    </script>
+</body>
+</html>
