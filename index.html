@@ -86,6 +86,19 @@
 
         .lil-gui .title { border-bottom: 1px solid var(--fg-dim); }
 
+        #spectrogram-panel {
+            position: absolute; bottom: 20px; right: 20px;
+            width: 300px; height: 150px;
+            border: 1px solid var(--fg-main); background: var(--bg-deep);
+            z-index: 50; display: block;
+        }
+
+        #spectrogram-title {
+            position: absolute; top: -10px; left: 10px;
+            background: var(--bg-deep); padding: 0 5px;
+            font-size: 10px; color: var(--fg-main); letter-spacing: 1px;
+        }
+
         #game-overlay {
             position: absolute; top: 50%; left: 50%;
             transform: translate(-50%, -50%);
@@ -124,6 +137,11 @@
         </div>
     </div>
 
+    <div id="spectrogram-panel">
+        <div id="spectrogram-title">FFT_WATERFALL</div>
+        <canvas id="spectrogram-canvas" width="300" height="150"></canvas>
+    </div>
+
     <div id="game-overlay">
         <strong>CLICK TO INITIATE SURVIVAL</strong><br><br>
         [W][A][S][D] Move | Mouse Look<br>
@@ -145,6 +163,9 @@
         const pauseBtn = document.getElementById('pauseBtn');
         const audioElement = document.getElementById('audioElement');
         const gameOverlay = document.getElementById('game-overlay');
+        const specPanel = document.getElementById('spectrogram-panel');
+        const specCanvas = document.getElementById('spectrogram-canvas');
+        const specCtx = specCanvas.getContext('2d');
 
         let audioCtx, track, panner, analyser, convolver, materialFilter;
         let wetGain, dryGain;
@@ -174,22 +195,34 @@
             generateSpline: () => createGenerativeSpline(),
             roomScale: 'Studio',
             wallMaterial: 'Wood',
-            cameraMode: 'Free Fly'
+            cameraMode: 'Free Fly',
+            showWaterfall: true,
+            showRays: true
         };
 
         const rooms = {
-            'Closet': { duration: 0.2, decay: 8.0 },
-            'Studio': { duration: 0.8, decay: 4.0 },
-            'Cathedral': { duration: 4.0, decay: 1.0 },
-            'Stadium': { duration: 6.0, decay: 0.5 }
+            'Closet': { duration: 0.2, decay: 8.0, size: 8 },
+            'Studio': { duration: 0.8, decay: 4.0, size: 20 },
+            'Cathedral': { duration: 4.0, decay: 1.0, size: 50 },
+            'Stadium': { duration: 6.0, decay: 0.5, size: 100 }
         };
 
         const materials = {
-            'Concrete': { type: 'highpass', freq: 100 },
-            'Wood': { type: 'lowpass', freq: 4000 },
-            'Carpet': { type: 'lowpass', freq: 800 },
-            'Glass': { type: 'highpass', freq: 2000 }
+            'Concrete': { type: 'highpass', freq: 100, bounceLoss: 0.1 },
+            'Wood': { type: 'lowpass', freq: 4000, bounceLoss: 0.4 },
+            'Carpet': { type: 'lowpass', freq: 800, bounceLoss: 0.8 },
+            'Glass': { type: 'highpass', freq: 2000, bounceLoss: 0.05 }
         };
+
+        const rayCount = 150;
+        let rayGeometry, rayMaterial, rayLines;
+        let rayData = [];
+
+        const particleCount = 400; 
+        const asciiChars = ['0', '1', '+', ':', '*', '.'];
+        const particleSystems = [];
+        let pIndices = Array(asciiChars.length).fill(0);
+        let particleBaseColor = new THREE.Color(params.themeColor);
 
         try {
             init3DScene();
@@ -202,6 +235,7 @@
 
         function updateTheme(hex) {
             const color = new THREE.Color(hex);
+            particleBaseColor.set(hex);
             document.documentElement.style.setProperty('--fg-main', hex);
             
             if(floorUniforms) floorUniforms.uPeakColor.value = color;
@@ -209,6 +243,8 @@
             if(listenerMesh) listenerMesh.material.color = color;
             if(tubeMat) tubeMat.color = color;
             terrainMaterials.forEach(mat => mat.color = color);
+            
+            if(rayMaterial) rayMaterial.color = color;
         }
 
         async function initAudio() {
@@ -317,7 +353,9 @@
             scene = new THREE.Scene();
             scene.fog = new THREE.FogExp2(0x000000, 0.025);
             
-            camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 1000);
+            camera = new THREE.PerspectiveCamera(
+                45, window.innerWidth/window.innerHeight, 0.1, 1000
+            );
             camera.position.set(25, 18, 25);
             
             renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -325,7 +363,9 @@
             renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
             container.appendChild(renderer.domElement);
             
-            audioTexture = new THREE.DataTexture(dataArray, bufferLength, 1, THREE.RedFormat);
+            audioTexture = new THREE.DataTexture(
+                dataArray, bufferLength, 1, THREE.RedFormat
+            );
             
             floorUniforms = {
                 uTime: { value: 0.0 },
@@ -333,14 +373,15 @@
                 uGridColor: { value: new THREE.Color(0x222222) },
                 uBaseColor: { value: new THREE.Color(0x000000) },
                 uPeakColor: { value: new THREE.Color(params.themeColor) },
-                uIsSurvival: { value: 0.0 }
+                uIsSurvival: { value: 0.0 },
+                uPlayerPos: { value: new THREE.Vector3() } // Dynamic Tracker
             };
             
             const floorMat = new THREE.ShaderMaterial({
                 uniforms: floorUniforms,
                 vertexShader: `
                     uniform float uTime; uniform sampler2D uAudioData;
-                    uniform float uIsSurvival;
+                    uniform float uIsSurvival; uniform vec3 uPlayerPos;
                     varying float vHeight; varying vec2 vUv;
                     void main() {
                         vUv = uv; vec3 pos = position;
@@ -348,10 +389,14 @@
                         float audioSample = texture2D(uAudioData, vec2(dist*2.0, 0.5)).r;
                         float wave = sin(pos.x*0.4 + uTime)*cos(pos.y*0.4 + uTime)*0.5;
                         
-                        // Create a flat, calm island in the center for the cube
-                        float islandMask = smoothstep(0.015, 0.06, dist);
+                        // NEW: Island follows actual player coordinates seamlessly
+                        vec4 worldPos = modelMatrix * vec4(pos, 1.0);
+                        float distFromPlayer = distance(worldPos.xz, uPlayerPos.xz);
                         
+                        // Enforce wide 8-unit radius completely flat area
+                        float islandMask = smoothstep(8.0, 18.0, distFromPlayer);
                         float h = (wave * islandMask) + (audioSample * 6.0 * islandMask); 
+                        
                         pos.z = mix(h, 0.0, uIsSurvival); 
                         vHeight = h;
                         gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
@@ -375,7 +420,9 @@
                     }`,
                 transparent: true
             });
-            const floorMesh = new THREE.Mesh(new THREE.PlaneGeometry(120, 120, 128, 128), floorMat);
+            const floorMesh = new THREE.Mesh(
+                new THREE.PlaneGeometry(120, 120, 128, 128), floorMat
+            );
             floorMesh.rotation.x = -Math.PI / 2; floorMesh.position.y = -1;
             scene.add(floorMesh);
             
@@ -395,6 +442,8 @@
             
             createGenerativeSpline();
             generateTerrain();
+            initParticles();
+            initDiagnostics(); 
             
             fpsControls = new PointerLockControls(camera, document.body);
             orbitControls = new OrbitControls(camera, renderer.domElement);
@@ -412,6 +461,120 @@
             
             window.addEventListener('resize', onWindowResize);
             renderer.setAnimationLoop(animate);
+        }
+
+        function initDiagnostics() {
+            rayGeometry = new THREE.BufferGeometry();
+            const rayPos = new Float32Array(rayCount * 6); 
+            rayGeometry.setAttribute('position', new THREE.BufferAttribute(rayPos, 3));
+            rayMaterial = new THREE.LineBasicMaterial({ 
+                color: params.themeColor, transparent: true, opacity: 0.8, 
+                blending: THREE.AdditiveBlending 
+            });
+            rayLines = new THREE.LineSegments(rayGeometry, rayMaterial);
+            rayLines.frustumCulled = false;
+            scene.add(rayLines);
+            
+            for(let i=0; i<rayCount; i++) {
+                rayData.push({
+                    pos: new THREE.Vector3(),
+                    dir: new THREE.Vector3(),
+                    energy: 0
+                });
+            }
+        }
+
+        function initParticles() {
+            asciiChars.forEach((char, index) => {
+                const canvas = document.createElement('canvas');
+                canvas.width = 64; canvas.height = 64;
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = 'transparent'; ctx.fillRect(0, 0, 64, 64);
+                ctx.fillStyle = '#ffffff'; 
+                ctx.font = 'bold 40px "JetBrains Mono", monospace';
+                ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                ctx.fillText(char, 32, 32);
+                
+                const tex = new THREE.CanvasTexture(canvas);
+                
+                const mat = new THREE.PointsMaterial({
+                    size: 1.5, map: tex, transparent: true,
+                    depthWrite: false, blending: THREE.AdditiveBlending,
+                    vertexColors: true, color: 0xffffff
+                });
+                
+                const geo = new THREE.BufferGeometry();
+                const pos = new Float32Array(particleCount * 3);
+                const cols = new Float32Array(particleCount * 3);
+                
+                geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+                
+                const points = new THREE.Points(geo, mat);
+                scene.add(points);
+                
+                const data = Array.from({length: particleCount}, () => ({ 
+                    life: 0, vel: new THREE.Vector3() 
+                }));
+                
+                particleSystems.push({ points, data });
+            });
+        }
+
+        function emitParticles(pos, count) {
+            for(let i=0; i<count; i++) {
+                const sysIdx = Math.floor(Math.random() * asciiChars.length);
+                const pIdx = pIndices[sysIdx];
+                const sys = particleSystems[sysIdx];
+                
+                sys.data[pIdx].life = 1.0;
+                sys.data[pIdx].vel.set(
+                    (Math.random() - 0.5) * 4.0,
+                    (Math.random() - 0.5) * 4.0,
+                    (Math.random() - 0.5) * 4.0
+                );
+                
+                const positions = sys.points.geometry.attributes.position.array;
+                positions[pIdx*3] = pos.x + (Math.random()-0.5)*1.5;
+                positions[pIdx*3+1] = pos.y + (Math.random()-0.5)*1.5;
+                positions[pIdx*3+2] = pos.z + (Math.random()-0.5)*1.5;
+                
+                pIndices[sysIdx] = (pIdx + 1) % particleCount;
+            }
+        }
+
+        function updateParticles(dt) {
+            particleSystems.forEach(sys => {
+                const positions = sys.points.geometry.attributes.position.array;
+                const colors = sys.points.geometry.attributes.color.array;
+                let needsUpdate = false;
+                
+                for(let i=0; i<particleCount; i++) {
+                    const p = sys.data[i];
+                    if (p.life > 0) {
+                        p.life -= dt * 0.4; 
+                        
+                        positions[i*3] += p.vel.x * dt;
+                        positions[i*3+1] += p.vel.y * dt;
+                        positions[i*3+2] += p.vel.z * dt;
+                        
+                        const c = particleBaseColor.clone().multiplyScalar(p.life);
+                        colors[i*3] = c.r;
+                        colors[i*3+1] = c.g;
+                        colors[i*3+2] = c.b;
+                        
+                        needsUpdate = true;
+                    } else if (colors[i*3] !== 0) {
+                        colors[i*3] = 0; colors[i*3+1] = 0; colors[i*3+2] = 0;
+                        needsUpdate = true;
+                    }
+                }
+                
+                if (needsUpdate) {
+                    sys.points.geometry.attributes.position.needsUpdate = true;
+                    sys.points.geometry.attributes.color.needsUpdate = true;
+                }
+            });
         }
 
         function createGenerativeSpline() {
@@ -435,7 +598,7 @@
 
         function generateTerrain() {
             scene.add(terrainGroup);
-            terrainGroup.visible = false; 
+            terrainGroup.visible = true; 
             obstacleBoxes = []; 
             
             const geometries = [
@@ -447,7 +610,7 @@
             for (let i = 0; i < 40; i++) {
                 const geo = geometries[Math.floor(Math.random() * geometries.length)];
                 const mat = new THREE.MeshBasicMaterial({ 
-                    color: params.themeColor, wireframe: true 
+                    color: params.themeColor, wireframe: true, transparent: true, opacity: 0.15 
                 });
                 terrainMaterials.push(mat);
                 
@@ -486,6 +649,14 @@
             archFolder.add(params, 'orbitSpeed', 0.1, 5.0).name('ORBIT_SPEED');
             archFolder.add(params, 'complexity', 3, 20).step(1).name('SPLINE_NODES');
             archFolder.add(params, 'generateSpline').name('EXTRACT_SPLINE');
+
+            const diagFolder = gui.addFolder('DIAGNOSTICS (ARCHITECT)');
+            diagFolder.add(params, 'showWaterfall').name('SPECTROGRAM').onChange(v => {
+                if (params.appMode === 'ARCHITECT') {
+                    specPanel.style.display = v ? 'block' : 'none';
+                }
+            });
+            diagFolder.add(params, 'showRays').name('ACOUSTIC_RAYS');
             
             const f2 = gui.addFolder('ACOUSTICS');
             f2.add(params, 'roomScale', ['Closet', 'Studio', 'Cathedral', 'Stadium'])
@@ -513,7 +684,10 @@
                 gameOverlay.innerHTML = "<strong>CLICK TO INITIATE SURVIVAL</strong><br><br>[W][A][S][D] Move | Mouse Look<br>Avoid the anomaly.";
                 
                 tubeMesh.visible = false;
-                terrainGroup.visible = true;
+                rayLines.visible = false;
+                specPanel.style.display = 'none';
+                
+                terrainMaterials.forEach(mat => { mat.opacity = 1.0; mat.transparent = false; });
                 floorUniforms.uIsSurvival.value = 1.0;
                 
                 transformControls.detach();
@@ -527,7 +701,9 @@
                 gameOverlay.style.display = 'none';
                 
                 tubeMesh.visible = true;
-                terrainGroup.visible = false;
+                if(params.showWaterfall) specPanel.style.display = 'block';
+                
+                terrainMaterials.forEach(mat => { mat.opacity = 0.15; mat.transparent = true; });
                 floorUniforms.uIsSurvival.value = 0.0;
                 
                 fpsControls.unlock();
@@ -573,9 +749,7 @@
                 }
             });
 
-            fpsControls.addEventListener('lock', () => {
-                gameOverlay.style.display = 'none';
-            });
+            fpsControls.addEventListener('lock', () => { gameOverlay.style.display = 'none'; });
 
             fpsControls.addEventListener('unlock', () => {
                 if (params.appMode === 'SURVIVAL') {
@@ -605,12 +779,88 @@
             return obstacleBoxes.some(box => pBox.intersectsBox(box));
         }
 
+        function updateDiagnostics(dt, pop) {
+            if (params.showWaterfall && params.appMode === 'ARCHITECT' && isPlaying) {
+                const w = specCanvas.width;
+                const h = specCanvas.height;
+                
+                specCtx.drawImage(specCanvas, 0, 0, w, h, 0, 2, w, h);
+                
+                specCtx.fillStyle = '#000000';
+                specCtx.fillRect(0, 0, w, 2);
+                
+                specCtx.beginPath();
+                for (let i = 0; i < bufferLength; i++) {
+                    let x = (i / bufferLength) * w;
+                    let y = 50 - (dataArray[i] / 255) * 45; 
+                    if (i === 0) specCtx.moveTo(x, y);
+                    else specCtx.lineTo(x, y);
+                }
+                specCtx.strokeStyle = params.themeColor;
+                specCtx.lineWidth = 1;
+                specCtx.stroke();
+            }
+
+            rayLines.visible = params.showRays && params.appMode === 'ARCHITECT';
+            if (rayLines.visible && isPlaying) {
+                const positions = rayLines.geometry.attributes.position.array;
+                const bounds = rooms[params.roomScale].size / 2; 
+                const loss = materials[params.wallMaterial].bounceLoss;
+
+                if (pop > 0.4) {
+                    for(let i=0; i<rayCount; i++) {
+                        if (rayData[i].energy <= 0.01) {
+                            rayData[i].pos.copy(audioSphere.position);
+                            rayData[i].dir.set(
+                                (Math.random()-0.5), (Math.random()-0.5), (Math.random()-0.5)
+                            ).normalize();
+                            rayData[i].energy = 1.0;
+                        }
+                    }
+                }
+
+                for(let i=0; i<rayCount; i++) {
+                    const r = rayData[i];
+                    if (r.energy > 0) {
+                        const speed = 30.0 * dt;
+                        r.pos.addScaledVector(r.dir, speed);
+                        r.energy -= dt * 0.3; 
+
+                        if (Math.abs(r.pos.x) > bounds) { 
+                            r.dir.x *= -1; r.energy -= loss; r.pos.x = Math.sign(r.pos.x)*(bounds-0.1); 
+                        }
+                        if (Math.abs(r.pos.y) > bounds) { 
+                            r.dir.y *= -1; r.energy -= loss; r.pos.y = Math.sign(r.pos.y)*(bounds-0.1); 
+                        }
+                        if (Math.abs(r.pos.z) > bounds) { 
+                            r.dir.z *= -1; r.energy -= loss; r.pos.z = Math.sign(r.pos.z)*(bounds-0.1); 
+                        }
+                        
+                        if (r.energy < 0) r.energy = 0;
+                    }
+
+                    const tailLength = r.energy * 3.0; 
+                    positions[i*6] = r.pos.x - (r.dir.x * tailLength);
+                    positions[i*6+1] = r.pos.y - (r.dir.y * tailLength);
+                    positions[i*6+2] = r.pos.z - (r.dir.z * tailLength);
+                    positions[i*6+3] = r.pos.x;
+                    positions[i*6+4] = r.pos.y;
+                    positions[i*6+5] = r.pos.z;
+                }
+                rayLines.geometry.attributes.position.needsUpdate = true;
+            }
+        }
+
         function animate() {
-            floorUniforms.uTime.value = clock.getElapsedTime();
+            const dt = clock.getDelta();
+            floorUniforms.uTime.value += dt;
+            
+            // Link dynamic player coordinate for the flat island safezone mask
+            floorUniforms.uPlayerPos.value.copy(listenerMesh.position);
             
             if (params.appMode === 'SURVIVAL') {
                 if (fpsControls.isLocked) {
-                    const speed = 0.3;
+                    const speed = 18.0 * dt;
                     const oldX = camera.position.x;
                     const oldZ = camera.position.z;
                     
@@ -627,19 +877,15 @@
                     newX = Math.max(-45, Math.min(45, newX));
                     newZ = Math.max(-45, Math.min(45, newZ));
 
-                    if (!checkCollision(newX, oldZ)) {
-                        camera.position.x = newX;
-                    }
-                    if (!checkCollision(camera.position.x, newZ)) {
-                        camera.position.z = newZ;
-                    }
+                    if (!checkCollision(newX, oldZ)) { camera.position.x = newX; }
+                    if (!checkCollision(camera.position.x, newZ)) { camera.position.z = newZ; }
 
                     listenerMesh.position.x = camera.position.x;
                     listenerMesh.position.z = camera.position.z;
                 }
 
                 if (isPlaying) {
-                    const enemySpeed = 0.12;
+                    const enemySpeed = 7.0 * dt;
                     const direction = new THREE.Vector3().subVectors(
                         listenerMesh.position, audioSphere.position
                     );
@@ -673,6 +919,7 @@
                 }
             }
             
+            let pop = 0;
             if (isPlaying && analyser) {
                 analyser.getByteFrequencyData(dataArray);
                 audioTexture.needsUpdate = true; 
@@ -681,15 +928,21 @@
                 for (let i = 0; i < 4; i++) { sum += dataArray[i]; }
                 let avg = sum / 4;
                 let normalized = avg / 255;
-                let pop = Math.pow(normalized, 1.5) * params.pulseIntensity;
+                pop = Math.pow(normalized, 1.5) * params.pulseIntensity;
                 
                 targetScale.set(1 + pop, 1 + pop, 1 + pop);
                 audioSphere.scale.lerp(targetScale, 0.25);
+                
+                if (pop > 0.3) {
+                    emitParticles(audioSphere.position, Math.floor(pop * 6));
+                }
             } else {
                 targetScale.set(1, 1, 1);
                 audioSphere.scale.lerp(targetScale, 0.1);
             }
             
+            updateDiagnostics(dt, pop);
+            updateParticles(dt);
             syncAudioPosition();
             renderer.render(scene, camera);
         }
